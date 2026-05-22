@@ -317,7 +317,6 @@ def segment_greedy_fit(pts2: np.ndarray, scale: float, line_tol: float, circ_tol
             else:
                 primitives.append(('spline', [(round(float(x), 3), round(float(y), 3)) for x, y in seg.tolist()]))
             i = best_j + 1
-    # merge adjacent colinear lines to reduce fragmentation; use relaxed angle tolerance and a gap tolerance proportional to scale
     primitives = _merge_adjacent_lines(primitives)
 
     return primitives
@@ -802,24 +801,6 @@ def build_action_instances_from_entry(entry, line_tol=1e-4, circ_tol=1e-4, plot_
         if pts2.shape[0] < 2:
             print(f"  Warning: Loop has less than 2 distinct points after duplicate removal, skipping")
             continue
-
-        # segment_greedy_fit is ~O(n³). Slice-extracted loops can have 3000+
-        # points which makes the worker hang past the multiprocessing timeout.
-        # Arc-length-uniform downsample to a cap that's still dense enough
-        # to recover all primitives (corners + arcs).
-        _MAX_LOOP_PTS = 300
-        if pts2.shape[0] > _MAX_LOOP_PTS:
-            seg = np.linalg.norm(np.diff(pts2, axis=0), axis=1)
-            cum = np.concatenate([[0.0], np.cumsum(seg)])
-            total = cum[-1]
-            if total > 0:
-                t = np.linspace(0.0, total, _MAX_LOOP_PTS, endpoint=False)
-                idx = np.searchsorted(cum, t, side='right') - 1
-                idx = np.clip(idx, 0, pts2.shape[0] - 2)
-                t0, t1 = cum[idx], cum[idx + 1]
-                frac = np.where(t1 > t0, (t - t0) / (t1 - t0), 0.0)
-                pts2 = pts2[idx] + frac[:, None] * (pts2[idx + 1] - pts2[idx])
-                pts2 = remove_duplicate_points_2d(pts2, tolerance=1e-6)
 
         bbox = pts2.max(axis=0) - pts2.min(axis=0)
         scale = math.hypot(bbox[0], bbox[1])

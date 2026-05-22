@@ -2215,16 +2215,18 @@ def greedy_iou_based_pruning(precomp, gt_mesh, output_folder="search", alpha=0.0
                 heights, 
                 f'{output_folder}/best_greedy_parallel_extrude_only.stl'
             )
-            # Extract the solid names and script body (skip import lines, and
-            # also skip the embedded export/print to _extrude_only.stl — the
-            # final script only needs the build sequence, not intermediate
-            # exports).
+            # Extract the solid names and script body. Skip imports,
+            # exports/prints, and the embedded `result = ...` / `result =
+            # result.add(...)` lines — the outer composition block below
+            # rebuilds those, so leaving them in produces duplicates.
             extrude_lines = extrude_script.split('\n')
             for line in extrude_lines:
                 stripped = line.strip()
                 if not stripped or stripped.startswith('import '):
                     continue
                 if 'cq.exporters.export' in stripped or stripped.startswith('print('):
+                    continue
+                if stripped.startswith('result ='):
                     continue
                 final_script_lines.append(line)
                 if 'solid_' in line and '=' in line and 'extrude' in line:
