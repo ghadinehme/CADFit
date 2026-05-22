@@ -374,23 +374,25 @@ def _process_extrusion_worker(args):
     def timeout_handler(signum, frame):
         raise TimeoutError("Extrusion processing timed out")
     
-    # Set 30 second timeout
+    # Per-sketch timeout. Dense slice loops (3000+ pts × many loops) make
+    # `segment_greedy_fit` (~O(n²)) take 1-2 min on the worst sketches —
+    # we still want to skip truly stuck workers but not drop legitimate ones.
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(30)
-    
+    signal.alarm(300)
+
     try:
         translation_data = load_translation_analysis(translation_analysis_folder, sketch_idx)
-        
+
         if translation_data is None:
             signal.alarm(0)  # Cancel the alarm
             return sketch_idx, []
-        
+
         extrusions = create_extrusion_from_translation(entry, translation_data, sketch_idx)
         signal.alarm(0)  # Cancel the alarm
         return sketch_idx, extrusions
     except TimeoutError:
         signal.alarm(0)  # Cancel the alarm
-        print(f"  ⏱️  Sketch {sketch_idx} extrusion processing timed out after 10 seconds")
+        print(f"  ⏱️  Sketch {sketch_idx} extrusion processing timed out after 300 seconds")
         return sketch_idx, []
     except Exception as e:
         signal.alarm(0)  # Cancel the alarm
@@ -405,23 +407,23 @@ def _process_revolve_worker(args):
     def timeout_handler(signum, frame):
         raise TimeoutError("Revolve processing timed out")
     
-    # Set 30 second timeout
+    # Per-sketch timeout; mirror the extrusion worker's headroom.
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(60)
-    
+    signal.alarm(300)
+
     try:
         revolve_configs = load_revolve_analysis(revolve_analysis_folder, sketch_idx)
-        
+
         if not revolve_configs:
             signal.alarm(0)  # Cancel the alarm
             return sketch_idx, []
-        
+
         revolves = create_revolve_from_analysis(entry, revolve_configs, sketch_idx)
         signal.alarm(0)  # Cancel the alarm
         return sketch_idx, revolves
     except TimeoutError:
         signal.alarm(0)  # Cancel the alarm
-        print(f"  ⏱️  Sketch {sketch_idx} revolve processing timed out after 10 seconds")
+        print(f"  ⏱️  Sketch {sketch_idx} revolve processing timed out after 300 seconds")
         return sketch_idx, []
     except Exception as e:
         signal.alarm(0)  # Cancel the alarm
