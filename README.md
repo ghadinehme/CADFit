@@ -110,6 +110,16 @@ process_single_stl("abc_hard/00013080.stl",
                     max_iterations=1)
 ```
 
+### Parallelized Multi-Processed Thread Limited Run
+
+You can run the pipeline over larger batches of files with adjustable multi-processing and explicit thread counts (without environment variables) using `run_pipeline_parallel.py`:
+
+```bash
+python run_pipeline_parallel.py <input_folder> --n-procs <N> --n-threads <N>
+```
+
+By default this suppresses all output and only tracks failure/success with a progress bar. Pass `--verbose` to see the full logs.
+
 ---
 
 ## Citation
