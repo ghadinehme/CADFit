@@ -16,3 +16,13 @@ networkx>=3.0
 rtree>=1.0
 tqdm>=4.65
 pymeshlab==2025.7
+fast-simplification>=0.1
+
+# Optional — only required if you pass --filter-sketches to run_pipeline.py.
+# The DINOv2 + MLP loop classifier needs torch (GPU recommended), PyVista
+# with an off-screen renderer (Xvfb on headless Linux), Pillow, and the
+# HuggingFace Hub client to fetch the MLP weights on first use.
+# torch>=2.0
+# pyvista>=0.43
+# Pillow>=10
+# huggingface-hub>=0.20

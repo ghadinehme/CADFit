@@ -546,8 +546,15 @@ def refine_with_fillet_chamfer(src_script: str, src_stl: str, gt_stl: str,
     return disk_iou, len(ops), new_script, output_stl
 
 
-def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normalize=True):
-    """Run analysis steps to generate translation and revolve analysis"""
+def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normalize=True,
+                        filter_sketches=False, filter_threshold=None,
+                        filter_model_path=None, filter_norm_path=None):
+    """Run analysis steps to generate translation and revolve analysis.
+
+    If `filter_sketches=True`, runs the DINOv2+MLP loop classifier between
+    the loop-splitting (4b/4c) and translation/revolve analysis (5/6) steps.
+    The classifier downloads its weights from HuggingFace Hub on first use.
+    """
     
     # Ensure output folder exists
     os.makedirs(output_folder, exist_ok=True)
@@ -670,11 +677,30 @@ def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normaliz
             json.dump(axis_data, f, indent=2)
         
         print(f"✓ Saved {len(axis_data)} sketches for revolve analysis")
-        
+
     except Exception as e:
         print(f"✗ Error preparing revolve data: {e}")
         return False
-    
+
+    # Optional: DINOv2-based loop classifier. Drops loops that the model
+    # judges unlikely to be useful sketch primitives, shrinking the search
+    # space for translation/revolve analysis and greedy reconstruction.
+    if filter_sketches:
+        print(f"\n🤖 Filtering loops with DINOv2+MLP classifier...")
+        try:
+            from filter_loops import filter_jsons_inplace
+            to_filter = [p for p in (loops_split_path, loops_split_revolve_path)
+                         if os.path.exists(p)]
+            filter_jsons_inplace(
+                stl_path, to_filter,
+                threshold=filter_threshold,
+                model_path=filter_model_path,
+                norm_path=filter_norm_path,
+            )
+        except Exception as e:
+            print(f"⚠️  Sketch filtering failed ({type(e).__name__}: {e}); "
+                  "continuing with unfiltered loops")
+
     # Step 5: Run translation analysis
     print(f"\n📊 Step 5/7: Running translation analysis...")
     # CADFIT_INNER_WORKERS overrides everything (useful when wrapping the
@@ -718,7 +744,7 @@ def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normaliz
 
 
 def _decimate_input_if_needed(stl_path: str, output_folder: str,
-                               target_faces: int = 50_000) -> str:
+                               target_faces: int = 30_000) -> str:
     """If the input STL has more than `target_faces`, write a decimated copy
     into `output_folder/decimated_input.stl` and return that path. Otherwise
     return the original path unchanged. All downstream sketch-extraction
@@ -736,32 +762,58 @@ def _decimate_input_if_needed(stl_path: str, output_folder: str,
         return stl_path
     if len(m.faces) <= target_faces:
         return stl_path
+    out_path = os.path.join(output_folder, "decimated_input.stl")
+    os.makedirs(output_folder, exist_ok=True)
+    n_in = len(m.faces)
+
+    # Tier 1: fast_simplification (pure C++, robust, preserves CAD geometry
+    # exactly). Iterate target_reduction since a single pass under-reduces on
+    # heavily non-manifold meshes. pymeshlab's quadric_edge_collapse SEGFAULTS
+    # on some large non-watertight STLs, so it's avoided entirely.
     try:
-        import pymeshlab
-        out_path = os.path.join(output_folder, "decimated_input.stl")
-        os.makedirs(output_folder, exist_ok=True)
-        ms = pymeshlab.MeshSet()
-        ms.add_mesh(pymeshlab.Mesh(
-            vertex_matrix=np.asarray(m.vertices, dtype=np.float64),
-            face_matrix=np.asarray(m.faces, dtype=np.int32),
-        ))
-        ms.meshing_decimation_quadric_edge_collapse(
-            targetfacenum=target_faces,
-            preservenormal=True,
-            preserveboundary=True,
-        )
-        ms.save_current_mesh(out_path)
-        print(f"📉 Decimated input from {len(m.faces):,} → {target_faces:,} faces "
-              f"→ {out_path}")
+        import fast_simplification
+        v = np.asarray(m.vertices, dtype=np.float64)
+        f = np.asarray(m.faces, dtype=np.int32)
+        for _ in range(6):
+            if len(f) <= target_faces * 1.1:
+                break
+            red = min(max(1.0 - target_faces / len(f), 0.1), 0.95)
+            v, f = fast_simplification.simplify(v, f, target_reduction=red)
+        if len(f) <= target_faces * 1.3:
+            trimesh.Trimesh(vertices=v, faces=f, process=False).export(out_path)
+            print(f"📉 Decimated input {n_in:,} → {len(f):,} faces (fast_simplification) → {out_path}")
+            return out_path
+        # else fall through to voxel remesh — topology blocked the collapse.
+        print(f"   fast_simplification stalled at {len(f):,} faces; voxel-remeshing")
+    except Exception as e:
+        print(f"⚠️  fast_simplification failed ({e}); voxel-remeshing")
+
+    # Tier 2: voxel remesh — topology-agnostic, always yields a clean
+    # watertight mesh. Loses some sharp-edge fidelity but keeps the pipeline
+    # alive on pathological meshes that no edge-collapse can reduce.
+    try:
+        diag = float(np.linalg.norm(m.extents))
+        for res in (128, 96, 72):
+            pitch = diag / res
+            rm = m.voxelized(pitch=pitch).fill().marching_cubes
+            if len(rm.faces) <= target_faces * 1.5:
+                rm.export(out_path)
+                print(f"📉 Voxel-remeshed input {n_in:,} → {len(rm.faces):,} faces (res={res}) → {out_path}")
+                return out_path
+        # Last resort: take whatever the coarsest voxel gave.
+        rm.export(out_path)
+        print(f"📉 Voxel-remeshed input {n_in:,} → {len(rm.faces):,} faces (coarsest) → {out_path}")
         return out_path
     except Exception as e:
-        print(f"⚠️  Decimation failed ({e}); using original {len(m.faces):,}-face mesh")
+        print(f"⚠️  Decimation failed ({e}); using original {n_in:,}-face mesh")
         return stl_path
 
 
 def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel",
                                    over_threshold=0.02, under_threshold=0.01, max_iterations=5,
-                                   apply_fillet_chamfer=False, keep_history=False):
+                                   apply_fillet_chamfer=False, keep_history=False,
+                                   filter_sketches=False, filter_threshold=None,
+                                   filter_model_path=None, filter_norm_path=None):
     """Process a single STL file with iterative refinement using precomputed analysis"""
     stl_name = os.path.basename(stl_path)
     stl_id = os.path.splitext(stl_name)[0]
@@ -807,7 +859,11 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
     print(f"\n🚀 INITIAL RECONSTRUCTION")
     print(f"{'='*80}")
 
-    if not run_analysis_steps(stl_path, output_folder, normalize=True):
+    if not run_analysis_steps(stl_path, output_folder, normalize=True,
+                                filter_sketches=filter_sketches,
+                                filter_threshold=filter_threshold,
+                                filter_model_path=filter_model_path,
+                                filter_norm_path=filter_norm_path):
         print(f"✗ Failed to complete analysis steps for {stl_name}")
         return
     
@@ -1141,6 +1197,23 @@ def main():
     parser.add_argument('--keep-history', action='store_true',
                         help='Keep all intermediate files in the output folder. '
                              'By default, only the final STL, .py, and final_iou.json are kept.')
+    parser.add_argument('--filter-sketches', action='store_true',
+                        help='Run the DINOv2+MLP loop classifier between loop '
+                             'extraction and translation/revolve analysis. '
+                             'Drops loops the model judges unlikely to be useful '
+                             'sketch primitives. Off by default. Downloads the '
+                             'model from huggingface.co/ghadinehme/CADFit on '
+                             'first use (~9 MB) and pulls DINOv2 ViT-L/14 weights '
+                             '(~1.5 GB) via torch.hub.')
+    parser.add_argument('--filter-threshold', type=float, default=None,
+                        help='Override the classifier threshold (default: from '
+                             'checkpoint, ~0.425).')
+    parser.add_argument('--filter-model', default=None,
+                        help='Path to a local model_mlp_med.pt. If omitted, '
+                             'downloads from HuggingFace Hub.')
+    parser.add_argument('--filter-norm', default=None,
+                        help='Path to a local normalization.npz. If omitted, '
+                             'downloads from HuggingFace Hub.')
     args = parser.parse_args()
 
     in_dir = args.input_folder.rstrip('/')
@@ -1197,6 +1270,10 @@ def main():
                 max_iterations=args.max_iterations,
                 apply_fillet_chamfer=args.fillet_chamfer,
                 keep_history=args.keep_history,
+                filter_sketches=args.filter_sketches,
+                filter_threshold=args.filter_threshold,
+                filter_model_path=args.filter_model,
+                filter_norm_path=args.filter_norm,
             )
             successful += 1
         except Exception as e:
