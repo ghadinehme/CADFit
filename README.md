@@ -6,7 +6,7 @@
 > <sup>1</sup>Massachusetts Institute of Technology  
 > <sup>2</sup>Siemens Digital Industries Software
 
-[![arXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg)](https://arxiv.org/abs/2605.01171) [![Project Page](https://img.shields.io/badge/Project-Website-green)](https://ghadinehme.github.io/cadfit.github.io/) [![HuggingFace](https://img.shields.io/badge/🤗-Model-yellow)](https://huggingface.co/ghadinehme/CADFit)
+[![arXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg)](https://arxiv.org/abs/2605.01171) [![Project Page](https://img.shields.io/badge/Project-Website-green)](https://ghadinehme.github.io/cadfit.github.io/) [![HuggingFace](https://img.shields.io/badge/🤗-Model-yellow)](https://huggingface.co/ghadinehme/CADFit) [![YouTube](https://img.shields.io/badge/YouTube-Video-red?logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=YBYm-moWSEs)
 
 </div>
 
