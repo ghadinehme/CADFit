@@ -6,7 +6,7 @@
 > <sup>1</sup>Massachusetts Institute of Technology  
 > <sup>2</sup>Siemens Digital Industries Software
 
-[![arXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg)](https://arxiv.org/abs/2605.01171) [![Project Page](https://img.shields.io/badge/Project-Website-green)](https://ghadinehme.github.io/cadfit.github.io/)
+[![arXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg)](https://arxiv.org/abs/2605.01171) [![Project Page](https://img.shields.io/badge/Project-Website-green)](https://ghadinehme.github.io/cadfit.github.io/) [![HuggingFace](https://img.shields.io/badge/🤗-Model-yellow)](https://huggingface.co/ghadinehme/CADFit)
 
 </div>
 
@@ -124,6 +124,14 @@ If you find our work helpful, please consider citing:
   year={2026}
 }
 ```
+
+---
+
+## License
+
+Released under the **Creative Commons Attribution-NonCommercial 4.0 International** (CC BY-NC 4.0) license — free for academic and research use; see [LICENSE](LICENSE) for full terms.
+
+A provisional patent application has been filed covering the CADFit method. Commercial licensing inquiries: `ghadi@mit.edu`.
 
 ---
 
