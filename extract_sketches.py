@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 simplified extract_sketches.py
@@ -21,6 +22,21 @@ from typing import List, Tuple
 
 import numpy as np
 import trimesh
+
+# Deterministic sampling. Every analysis stage draws random points on the
+# surface (plane detection, Chamfer sweeps, revolve axis tests); left unseeded
+# each run detects a slightly different set of planes and therefore a different
+# set of loops, so identical inputs produced reconstructions ranging from
+# IoU 0.82 to 0.98. Seed once at import; override with CADFIT_SEED.
+import numpy as _np_seed_mod
+CADFIT_SEED = int(os.environ.get("CADFIT_SEED", "0"))
+_np_seed_mod.random.seed(CADFIT_SEED)
+try:
+    import random as _py_random
+    _py_random.seed(CADFIT_SEED)
+except Exception:
+    pass
+
 from iou import normalize_mesh
 
 

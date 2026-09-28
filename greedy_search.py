@@ -88,7 +88,108 @@ def load_revolve_analysis(analysis_folder: str, sketch_idx: int) -> List[Dict]:
     return revolve_configs
 
 
-def create_extrusion_from_translation(entry: Dict, translation_data: Dict, sketch_idx: int) -> List[Dict]:
+def _parallel_plane_offsets(loops_data: List[Dict], angle_tol: float = 0.02) -> List[Dict]:
+    """Group loop planes by normal direction and record their signed offsets.
+
+    Returns a list of {'normal': [x,y,z], 'offsets': [...]} — one entry per
+    distinct orientation, offsets measured as dot(origin, normal).
+    """
+    groups: List[Dict] = []
+    for e in loops_data:
+        n = np.array(e.get('normal', [0, 0, 1]), dtype=float)
+        nn = np.linalg.norm(n)
+        if nn == 0:
+            continue
+        n = n / nn
+        o = float(np.dot(np.array(e.get('origin', [0, 0, 0]), dtype=float), n))
+        for g in groups:
+            # Same orientation, either sign — offsets are stored in g's frame.
+            d = float(np.dot(n, g['normal']))
+            if abs(abs(d) - 1.0) < angle_tol:
+                g['offsets'].append(o if d > 0 else -o)
+                break
+        else:
+            groups.append({'normal': n.tolist(), 'offsets': [o]})
+    for g in groups:
+        g['offsets'] = sorted(set(round(v, 6) for v in g['offsets']))
+    return groups
+
+
+_MAX_SNAPS_PER_INTERVAL = int(os.environ.get("CADFIT_MAX_SNAPS", "6"))
+
+
+def _snapped_heights(origin, normal, t_min, t_max, plane_offsets,
+                     min_height: float = 1e-3) -> List[float]:
+    """Heights that end on a parallel loop plane inside the sweep interval.
+
+    Capped per interval: a mesh with ~100 sketches can otherwise emit hundreds
+    of extra candidates, and the greedy search is quadratic in pool size (it
+    timed out at 50 minutes on 00000210). The shortest snaps are kept — those
+    are the ones that terminate at a genuine cross-section change rather than
+    running most of the interval.
+    """
+    if not plane_offsets:
+        return []
+    n = np.asarray(normal, dtype=float)
+    base = float(np.dot(np.asarray(origin, dtype=float), n))
+    out = []
+    for g in plane_offsets:
+        gn = np.asarray(g['normal'], dtype=float)
+        d = float(np.dot(n, gn))
+        if abs(abs(d) - 1.0) >= 0.02:
+            continue
+        for off in g['offsets']:
+            off_here = off if d > 0 else -off
+            h = off_here - base            # distance from this sketch's plane
+            if min_height < h < (t_max - t_min) - min_height:
+                out.append(round(h, 6))
+    out = sorted(set(out))
+    return out[:_MAX_SNAPS_PER_INTERVAL]
+
+
+def _gt_bounds_normalized(gt_path: str, normalize: bool) -> Optional[np.ndarray]:
+    """Axis-aligned bounds of the ground truth in the same frame the sketches
+    live in, so extrusions can be clipped to the part's real extent."""
+    try:
+        m = trimesh.load(gt_path, force='mesh')
+        if normalize:
+            m = normalize_mesh(m)
+        return np.asarray(m.bounds, dtype=float)
+    except Exception:
+        return None
+
+
+def _clip_to_bounds(origin, normal, t_min, t_max, gt_bounds, eps: float = 1e-9):
+    """Trim a sweep interval so the extrusion stays inside `gt_bounds`.
+
+    Interval detection pads by one step (see analyze_loop_translation), which
+    makes extrusions overhang the part by that pad along the sweep axis. The
+    pad is useful for *finding* the interval but has no business appearing in
+    the solid, so clip the swept span to the ground truth's own extent.
+    """
+    if gt_bounds is None:
+        return t_min, t_max
+    n = np.asarray(normal, dtype=float)
+    o = np.asarray(origin, dtype=float)
+    # Support of the bounding box along +/- n.
+    lo, hi = gt_bounds[0], gt_bounds[1]
+    corners = np.array([[lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
+                        [lo[0], hi[1], lo[2]], [hi[0], hi[1], lo[2]],
+                        [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]],
+                        [lo[0], hi[1], hi[2]], [hi[0], hi[1], hi[2]]])
+    proj = corners @ n
+    base = float(o @ n)
+    t_lo, t_hi = float(proj.min()) - base, float(proj.max()) - base
+    new_min = max(t_min, t_lo)
+    new_max = min(t_max, t_hi)
+    if new_max - new_min <= eps:
+        return t_min, t_max          # degenerate clip — leave it alone
+    return new_min, new_max
+
+
+def create_extrusion_from_translation(entry: Dict, translation_data: Dict, sketch_idx: int,
+                                      plane_offsets: Optional[List[Dict]] = None,
+                                      gt_bounds: Optional[np.ndarray] = None) -> List[Dict]:
     """
     Create extrusion operations from translation analysis data.
     
@@ -125,10 +226,13 @@ def create_extrusion_from_translation(entry: Dict, translation_data: Dict, sketc
         intervals = sorted(intervals, key=lambda iv: iv['t_end'] - iv['t_start'], reverse=True)[:5]
     
     import copy
+    clip = os.environ.get("CADFIT_CLIP_TO_BOUNDS", "1") == "1"
     for iv_idx, interval in enumerate(intervals):
         t_min = interval['t_start']
         t_max = interval['t_end']
-        
+        if clip:
+            t_min, t_max = _clip_to_bounds(origin, normal, t_min, t_max, gt_bounds)
+
         # Move origin by t_min * normal
         new_origin = origin + t_min * normal
         height = t_max - t_min
@@ -153,7 +257,26 @@ def create_extrusion_from_translation(entry: Dict, translation_data: Dict, sketc
                 't_min': t_min,
                 't_max': t_max
             })
-    
+
+            # Shorter variants ending on a parallel loop plane. The interval
+            # bounds where the loop's boundary stays on the surface; the solid
+            # it encloses often ends earlier, at the plane where the
+            # cross-section changes.
+            for h_snap in _snapped_heights(new_origin, normal, t_min, t_max,
+                                           plane_offsets or []):
+                extrusions.append({
+                    'type': 'extrude',
+                    'sketch_idx': sketch_idx,
+                    'actions': insts,
+                    'height': h_snap,
+                    'origin': new_origin.tolist(),
+                    'normal': normal.tolist(),
+                    'xdir': entry.get('xdir', [1, 0, 0]),
+                    'source': f'interval_{iv_idx}_snap{h_snap:g}',
+                    't_min': t_min,
+                    't_max': t_min + h_snap
+                })
+
     return extrusions
 
 
@@ -369,7 +492,7 @@ def create_revolve_from_analysis(entry: Dict, revolve_configs: List[Dict], sketc
 
 def _process_extrusion_worker(args):
     """Worker function for parallel extrusion processing."""
-    sketch_idx, entry, translation_analysis_folder = args
+    sketch_idx, entry, translation_analysis_folder, plane_offsets, gt_bounds = args
     
     def timeout_handler(signum, frame):
         raise TimeoutError("Extrusion processing timed out")
@@ -387,7 +510,8 @@ def _process_extrusion_worker(args):
             signal.alarm(0)  # Cancel the alarm
             return sketch_idx, []
 
-        extrusions = create_extrusion_from_translation(entry, translation_data, sketch_idx)
+        extrusions = create_extrusion_from_translation(entry, translation_data, sketch_idx,
+                                                       plane_offsets, gt_bounds)
         signal.alarm(0)  # Cancel the alarm
         return sketch_idx, extrusions
     except TimeoutError:
@@ -436,7 +560,8 @@ def precompute_operations_from_analysis(
     translation_analysis_folder: str,
     revolve_analysis_folder: str,
     output_folder: str = "search_precomputed",
-    num_workers: int = 8
+    num_workers: int = 8,
+    gt_bounds: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """
     Load pre-computed analysis results and create operation list.
@@ -468,10 +593,19 @@ def precompute_operations_from_analysis(
     print(f"\nProcessing extrusions from translation analysis (using {num_workers} workers)...")
     extrusion_count = 0
     
+    # Offsets of every detected loop plane, grouped by orientation. A sweep
+    # interval says how far a loop's *boundary* stays on the surface, which
+    # can run well past the solid region the loop encloses (e.g. a base
+    # outline whose outer wall continues upward past the slab). The planes of
+    # parallel loops mark where the cross-section actually changes, so they
+    # are the natural extra heights to offer alongside the raw interval.
+    plane_offsets = (_parallel_plane_offsets(loops_data)
+                     if os.environ.get("CADFIT_SNAP_HEIGHTS", "1") == "1" else [])
+
     # Prepare worker arguments
-    extrusion_args = [(sketch_idx, entry, translation_analysis_folder) 
+    extrusion_args = [(sketch_idx, entry, translation_analysis_folder, plane_offsets, gt_bounds)
                       for sketch_idx, entry in enumerate(loops_data)]
-    
+
     with mp.Pool(num_workers) as pool:
         results = pool.map(_process_extrusion_worker, extrusion_args)
     
@@ -640,6 +774,184 @@ def evaluate_single_operation(operation: Dict, gt_mesh_path: str, output_folder:
         return None
 
 
+
+def _beam_refine(evaluated_operations, gt_mesh_path, output_folder, normalize,
+                 greedy_iou, beam_width=12, max_depth=8):
+    """Beam search over the evaluated operations, seeded independently of greedy.
+
+    Greedy commits to a candidate the moment it improves the running IoU, so a
+    combination that only pays off once two or three plates are present is
+    unreachable. Every candidate's solid was already built and written to disk
+    during evaluation, so scoring a subset is just a manifold union — cheap
+    enough to explore a beam. Returns (iou, [ops]) or (None, None).
+    """
+    try:
+        import manifold3d
+        from iou import _cached_manifold, _to_manifold, _OP_ADD, _OP_INTERSECT
+    except Exception as e:
+        print(f"  Beam refine unavailable: {e}")
+        return None, None
+
+    gt = _cached_manifold(gt_mesh_path, normalize)
+    if gt is None:
+        return None, None
+
+    cands = []
+    for o in evaluated_operations:
+        if o.get('type') == 'revolve':
+            continue                      # unions of revolves are rebuilt differently
+        p = o.get('stl_path')
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            m = trimesh.load(p, force='mesh')
+            if m is None or not len(m.faces):
+                continue
+            man = _to_manifold(m)
+            if man is None or man.volume() <= 0:
+                continue
+        except Exception:
+            continue
+        cands.append((o, man))
+    if not cands:
+        return None, None
+
+    def score(mans):
+        u = mans[0] if len(mans) == 1 else manifold3d.Manifold.batch_boolean(mans, _OP_ADD)
+        i = manifold3d.Manifold.batch_boolean([gt, u], _OP_INTERSECT)
+        n = manifold3d.Manifold.batch_boolean([gt, u], _OP_ADD)
+        if i is None or n is None or abs(n.volume()) <= 0:
+            return 0.0
+        v = abs(i.volume()) / abs(n.volume())
+        return v if v <= 1.0 + 1e-6 else 0.0
+
+    print(f"\n  Beam refine over {len(cands)} candidates "
+          f"(width={beam_width}, depth={max_depth}); greedy was {greedy_iou:.6f}")
+    beam = [([], [], 0.0)]
+    best = (None, 0.0)
+    for depth in range(max_depth):
+        nxt = []
+        for idx_sel, man_sel, _ in beam:
+            taken = set(idx_sel)
+            for k, (o, man) in enumerate(cands):
+                if k in taken:
+                    continue
+                ms = man_sel + [man]
+                nxt.append((idx_sel + [k], ms, score(ms)))
+        if not nxt:
+            break
+        nxt.sort(key=lambda t: -t[2])
+        seen, pruned = set(), []
+        for sel, ms, v in nxt:
+            key = frozenset(sel)
+            if key in seen:
+                continue
+            seen.add(key)
+            pruned.append((sel, ms, v))
+            if len(pruned) >= beam_width:
+                break
+        beam = pruned
+        if beam[0][2] > best[1]:
+            best = ([cands[i][0] for i in beam[0][0]], beam[0][2])
+        print(f"    depth {depth+1}: IoU {beam[0][2]:.6f} ({len(beam[0][0])} ops)")
+        if beam[0][2] > 0.999:
+            break
+    if best[0] is None or best[1] <= greedy_iou + 1e-6:
+        print(f"  Beam refine did not beat greedy ({best[1]:.6f} <= {greedy_iou:.6f}); keeping greedy")
+        return None, None
+    print(f"  ✓ Beam refine improved IoU: {greedy_iou:.6f} -> {best[1]:.6f}")
+    return best[1], best[0]
+
+
+
+def _rebuild_clean_stl(script_path, out_stl, workdir=None):
+    """Re-export `script_path`'s solid as ONE watertight mesh.
+
+    The scripts compose with `result.add(...)`, which is a CadQuery *compound*:
+    the exported STL keeps every solid's shell, including the surfaces buried
+    inside overlaps. Volume then double-counts the overlapping regions, and any
+    IoU computed from that file is meaningless. Building each solid on its own
+    and unioning them with manifold3d yields the real solid.
+
+    Returns the union volume on success, else None (leaving the file alone).
+    """
+    import re as _re, subprocess as _sub, tempfile
+    try:
+        import manifold3d
+        from iou import _to_manifold, _OP_ADD
+    except Exception:
+        return None
+    try:
+        src = open(script_path).read()
+    except Exception:
+        return None
+    n = len(_re.findall(r'^solid_(\d+) = ', src, _re.M))
+    if n < 1:
+        return None
+    body = src.split('result = solid_1')[0]
+    workdir = workdir or tempfile.mkdtemp(prefix='cadfit_clean_')
+    os.makedirs(workdir, exist_ok=True)
+    mans = []
+    for i in range(1, n + 1):
+        stl_i = os.path.join(workdir, f'_solid_{i}.stl')
+        code = body + f"\nresult = solid_{i}\ncq.exporters.export(result, {stl_i!r})\n"
+        py_i = os.path.join(workdir, f'_solid_{i}.py')
+        with open(py_i, 'w') as f:
+            f.write(code)
+        ok = False
+        try:
+            r = _sub.run([sys.executable, py_i], capture_output=True, timeout=300)
+            if r.returncode == 0 and os.path.exists(stl_i):
+                mm = _to_manifold(trimesh.load(stl_i, force='mesh'))
+                if mm is not None:
+                    mans.append(mm)
+                    ok = True
+        except Exception:
+            ok = False
+        if not ok:
+            # A solid we cannot rebuild means the union would be missing
+            # material. Overwriting the pipeline's own STL with an incomplete
+            # solid silently destroys the result, so abandon the re-export and
+            # leave the existing file untouched.
+            print(f"  clean re-export aborted: solid_{i} of {n} failed to rebuild")
+            return None
+    if len(mans) != n:
+        print(f"  clean re-export aborted: rebuilt {len(mans)}/{n} solids")
+        return None
+    if not mans:
+        return None
+    try:
+        uni = mans[0] if len(mans) == 1 else manifold3d.Manifold.batch_boolean(mans, _OP_ADD)
+        if uni is None or not np.isfinite(uni.volume()) or uni.volume() <= 0:
+            return None
+        um = uni.to_mesh()
+        out = trimesh.Trimesh(vertices=np.asarray(um.vert_properties)[:, :3],
+                              faces=np.asarray(um.tri_verts), process=False)
+        # manifold3d emits a few zero-volume sliver shells alongside the real
+        # solid. They carry no material but make the exported STL read as
+        # non-watertight, which pushes the IoU reader onto its alpha-wrap
+        # fallback and inflates the score. Keep only shells with volume.
+        try:
+            shells = out.split(only_watertight=False)
+            if len(shells) > 1:
+                total = sum(abs(sh.volume) for sh in shells)
+                # A shell needs at least a tetrahedron's worth of faces to
+                # bound any volume; single stray triangles have none to compare.
+                keep = [sh for sh in shells
+                        if len(sh.faces) >= 4 and abs(sh.volume) > max(1e-9, 1e-6 * total)]
+                if keep:
+                    out = keep[0] if len(keep) == 1 else trimesh.util.concatenate(keep)
+                    if len(keep) < len(shells):
+                        print(f"  dropped {len(shells) - len(keep)} zero-volume sliver "
+                              f"shell(s) from the exported union")
+        except Exception:
+            pass
+        out.export(out_stl)
+        return abs(uni.volume())
+    except Exception:
+        return None
+
+
 def run_greedy_search(
     loops_split_path: str,
     loops_split_revolve_path: str,
@@ -678,7 +990,8 @@ def run_greedy_search(
         translation_analysis_folder=translation_analysis_folder,
         revolve_analysis_folder=revolve_analysis_folder,
         output_folder=output_folder,
-        num_workers=num_workers
+        num_workers=num_workers,
+        gt_bounds=_gt_bounds_normalized(ground_truth_path, normalize),
     )
     
     operations = precomp_data['operations']
@@ -838,10 +1151,52 @@ def run_greedy_search(
             sketch_data['insts'] = sketch_data['neg_actions']
         # If all are None, keep the default empty actions
     
-    # Convert to list (sorted by sketch_idx)
-    precomp_for_greedy = []
-    max_sketch_idx = max(sketches_by_idx.keys()) if sketches_by_idx else 0
-    
+    # Optionally hand greedy EVERY evaluated operation instead of only the
+    # single best positive/negative extrusion per sketch. Collapsing to one
+    # candidate per sketch discards alternative sweep intervals — a sketch
+    # whose best interval over-extrudes has no shorter variant left to offer,
+    # so greedy has to approximate that feature with other sketches. Keeping
+    # all intervals costs only a longer candidate list; greedy still selects
+    # by marginal IoU gain.
+    if os.environ.get("CADFIT_ALL_CANDIDATES", "1") == "1":
+        per_op = []
+        for result in evaluated_operations:
+            if result.get('iou', 0.0) < 0.0005:
+                continue
+            entry = {
+                'insts': result['actions'],
+                'faces_idx': result['sketch_idx'],
+                'pos_h': None, 'pos_iou': 0.0, 'pos_actions': None,
+                'neg_h': None, 'neg_iou': 0.0, 'neg_actions': None,
+                'revolve_angle': None, 'revolve_iou': 0.0,
+                'revolve_axis_start': None, 'revolve_axis_end': None,
+                'revolve_actions': None,
+                'is_symmetric': False, 'use_revolve': False, 'zero_only': False,
+            }
+            if result['type'] == 'extrude':
+                h = result['height']
+                if h > 0:
+                    entry['pos_h'], entry['pos_iou'] = h, result['iou']
+                else:
+                    entry['neg_h'], entry['neg_iou'] = abs(h), result['iou']
+            else:
+                entry['revolve_angle'] = result['angle']
+                entry['revolve_iou'] = result['iou']
+                entry['revolve_axis_start'] = result['axis_start']
+                entry['revolve_axis_end'] = result['axis_end']
+                entry['is_symmetric'] = True
+                entry['use_revolve'] = True
+            per_op.append(entry)
+        print(f"  Candidate pool: {len(per_op)} operations "
+              f"(all intervals) vs {len(sketches_by_idx)} best-per-sketch")
+        precomp_for_greedy = per_op
+        # Skip the per-sketch conversion below; the pool is already built.
+        max_sketch_idx = -1
+    else:
+        # Convert to list (sorted by sketch_idx)
+        precomp_for_greedy = []
+        max_sketch_idx = max(sketches_by_idx.keys()) if sketches_by_idx else 0
+
     for idx in range(max_sketch_idx + 1):
         if idx in sketches_by_idx:
             precomp_for_greedy.append(sketches_by_idx[idx])
@@ -872,6 +1227,47 @@ def run_greedy_search(
         num_workers=num_workers,
     )
     
+    # Beam-search post-pass. Greedy is order-dependent and commits early;
+    # the candidate solids are already on disk, so a wider search over the
+    # same pool is cheap and can only be accepted if it scores strictly
+    # better than what greedy found.
+    beam_applied = False
+    if os.environ.get("CADFIT_BEAM_REFINE", "1") == "1":
+        try:
+            b_iou, b_ops = _beam_refine(evaluated_operations, ground_truth_path,
+                                        output_folder, normalize, final_iou)
+        except Exception as e:
+            print(f"  Beam refine failed: {e}")
+            b_iou, b_ops = None, None
+        if b_ops:
+            try:
+                from cadquery_ops import generate_cadquery_script_multi_height
+                out_stl = os.path.join(output_folder, 'beam_refined.stl')
+                script = generate_cadquery_script_multi_height(
+                    [o['actions'] for o in b_ops],
+                    [o['height'] for o in b_ops],
+                    out_stl)
+                spath = os.path.join(output_folder, 'beam_refined.py')
+                if execute_cadquery_script(script, out_stl, spath):
+                    _shutil_b = __import__('shutil')
+                    _shutil_b.copy2(out_stl, os.path.join(output_folder, 'best_greedy_parallel.stl'))
+                    with open(spath) as f:
+                        lines = [ln for ln in f
+                                 if 'cq.exporters.export' not in ln
+                                 and not ln.lstrip().startswith('print(')]
+                    with open(os.path.join(output_folder, 'best_greedy_parallel.py'), 'w') as f:
+                        f.writelines(lines)
+                    final_iou = b_iou
+                    final_actions = [a for o in b_ops for a in o['actions']]
+                    with open(os.path.join(output_folder, 'greedy_final_iou.json'), 'w') as f:
+                        json.dump({'final_iou': b_iou,
+                                   'num_selected_operations': len(b_ops),
+                                   'source': 'beam_refine'}, f)
+                    print(f"  ✓ Wrote beam-refined reconstruction ({len(b_ops)} ops)")
+                    beam_applied = True
+            except Exception as e:
+                print(f"  Could not materialize beam result: {e}")
+
     # `greedy_tmp.stl` was built via manifold3d's robust union on each
     # candidate's STL and is clean + watertight — use that as the canonical
     # final STL. The saved `best_greedy_parallel.py` script is for human
@@ -880,7 +1276,7 @@ def run_greedy_search(
     final_stl_path = os.path.join(output_folder, 'best_greedy_parallel.stl')
     import shutil as _shutil
     greedy_tmp = os.path.join(output_folder, 'greedy_tmp.stl')
-    if os.path.exists(greedy_tmp):
+    if os.path.exists(greedy_tmp) and not beam_applied:
         try:
             _shutil.copy2(greedy_tmp, final_stl_path)
             print(f"✓ Replaced {os.path.basename(final_stl_path)} with manifold3d-built greedy_tmp.stl")
@@ -893,6 +1289,20 @@ def run_greedy_search(
     # produce different geometry — so re-measure on the file that will
     # actually flow downstream.
     from iou import mesh_iou_cpu_boolean as _iou_cpu
+
+    # Re-export the final solid as a single watertight mesh. The script
+    # composes with `.add()`, so the STL written above is a compound whose
+    # overlapping shells make its volume (and any IoU from it) unreliable.
+    if os.environ.get("CADFIT_CLEAN_EXPORT", "1") == "1" and os.path.exists(best_greedy_script):
+        try:
+            v = _rebuild_clean_stl(best_greedy_script, final_stl_path,
+                                   workdir=os.path.join(output_folder, '_clean'))
+            if v is not None:
+                print(f"✓ Re-exported {os.path.basename(final_stl_path)} as a single "
+                      f"watertight solid (volume {v:.6f})")
+        except Exception as e:
+            print(f"  Clean re-export failed ({e}); keeping compound STL")
+
     if os.path.exists(final_stl_path):
         try:
             rebuilt_iou = _iou_cpu(ground_truth_path, final_stl_path, normalize=True, verbose=False)

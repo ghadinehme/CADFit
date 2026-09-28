@@ -546,7 +546,7 @@ def refine_with_fillet_chamfer(src_script: str, src_stl: str, gt_stl: str,
     return disk_iou, len(ops), new_script, output_stl
 
 
-def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normalize=True,
+def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.01, normalize=True,
                         filter_sketches=False, filter_threshold=None,
                         filter_model_path=None, filter_norm_path=None):
     """Run analysis steps to generate translation and revolve analysis.
@@ -712,6 +712,11 @@ def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normaliz
         inner_workers = max(4, os.cpu_count() // max(int(os.environ.get("CADFIT_MAX_PARALLEL", "2")), 1))
     cmd5 = [sys.executable, _release_script("analyze_loop_translation.py"), loops_split_path, stl_path,
             "--output-folder", translation_analysis_folder, "--num-workers", str(inner_workers), "--no-plots"]
+    # Sweep resolution for extrusion heights. The default 0.01 is coarse for
+    # thin-walled parts whose walls are only a few hundredths of the
+    # normalized bbox, where it costs a large fraction of the wall thickness.
+    if os.environ.get("CADFIT_TRANS_STEP"):
+        cmd5 += ["--step", os.environ["CADFIT_TRANS_STEP"]]
     if normalize:
         cmd5.append("--normalize")
     if not run_command(cmd5, "Translation analysis", timeout=3600):
@@ -737,7 +742,8 @@ def run_analysis_steps(stl_path, output_folder, n_slices=5, delta=0.05, normaliz
             "--num-workers", str(inner_workers)]
     if normalize:
         cmd7.append("--normalize")
-    if not run_command(cmd7, "Greedy CAD reconstruction", timeout=3000):
+    if not run_command(cmd7, "Greedy CAD reconstruction",
+                       timeout=int(os.environ.get("CADFIT_GREEDY_TIMEOUT", "10800"))):
         return False
     
     return True
@@ -877,6 +883,36 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
     current_reconstruction = reconstructed_path
     current_cadquery_script = f"{output_folder}/best_greedy_parallel.py"
     iteration = 0
+
+    # Best-scoring solid seen at ANY step, not just the last one. Each
+    # refinement step (cut, union, fillet/chamfer) can move IoU either way,
+    # so keep a running best and fall back to it at the end. Without this a
+    # single bad step discards everything the earlier steps gained.
+    def _score(path):
+        try:
+            return mesh_iou_cpu_boolean(original_stl_path, path, normalize=True)
+        except Exception:
+            return None
+
+    best_refined_iou = _score(reconstructed_path)
+    best_refined_stl = reconstructed_path
+    best_refined_script = f"{output_folder}/best_greedy_parallel.py"
+    if best_refined_iou is not None:
+        print(f"  [track] initial reconstruction IoU: {best_refined_iou:.6f}")
+
+    def _record(stage):
+        """Score `current_reconstruction` and remember it if it is the best yet."""
+        nonlocal best_refined_iou, best_refined_stl, best_refined_script
+        v = _score(current_reconstruction)
+        if v is None:
+            return
+        if best_refined_iou is None or v > best_refined_iou + 1e-9:
+            print(f"  [track] {stage}: IoU {v:.6f} — new best")
+            best_refined_iou = v
+            best_refined_stl = current_reconstruction
+            best_refined_script = current_cadquery_script
+        else:
+            print(f"  [track] {stage}: IoU {v:.6f} (best stays {best_refined_iou:.6f})")
     
     # Check if initial CadQuery script exists
     if not os.path.exists(current_cadquery_script):
@@ -887,9 +923,11 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
     print(f"\n🔧 REFINEMENT PHASE: Removing over-reconstruction and adding under-reconstruction")
     print(f"{'='*80}")
 
-    under_volume = 10
-    
-    while iteration < max_iterations and under_volume > under_threshold:
+    # Ratio of under-reconstructed volume to GT volume; seeded above any
+    # sane threshold so the first iteration always runs.
+    under_ratio = 10.0
+
+    while iteration < max_iterations and under_ratio > under_threshold:
         iteration += 1
         print(f"\n{'='*60}")
         print(f"ITERATION {iteration}")
@@ -918,8 +956,12 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
         #     break
         
         # Handle over-reconstruction if volume > threshold
-        if over_volume > over_threshold:
-            print(f"\n🔨 Processing over-reconstruction (volume = {over_volume:.6f} > {over_threshold})")
+        # Compare the RATIO, not the raw volume: the thresholds are fractions
+        # of the ground-truth volume, and the GT is normalized into a [-1,1]
+        # cube, so a thin-walled part has a small absolute volume and would
+        # never clear an absolute 0.02 no matter how badly over-reconstructed.
+        if over_ratio > over_threshold:
+            print(f"\n🔨 Processing over-reconstruction (ratio = {over_ratio:.6f} > {over_threshold})")
             
             # Run analysis on over-reconstruction
             over_output = f"{output_folder}/refine_over_{iteration}"
@@ -955,6 +997,7 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
                 current_reconstruction = new_reconstruction
                 current_cadquery_script = cut_script_path
                 print(f"✓ Applied cut operation")
+                _record(f"iter{iteration} cut")
             else:
                 print("✗ Cut operation did not produce output")
                 break
@@ -978,8 +1021,8 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
         print(f"Under-reconstruction volume: {under_ratio:.6f}")
         
         # Handle under-reconstruction if volume > threshold
-        if under_volume > under_threshold:
-            print(f"\n➕ Processing under-reconstruction (volume = {under_volume:.6f} > {under_threshold})")
+        if under_ratio > under_threshold:
+            print(f"\n➕ Processing under-reconstruction (ratio = {under_ratio:.6f} > {under_threshold})")
             
             # Run analysis on under-reconstruction
             under_output = f"{output_folder}/refine_under_{iteration}"
@@ -1016,6 +1059,7 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
                 current_reconstruction = new_reconstruction
                 current_cadquery_script = union_script_path
                 print(f"✓ Applied union operation")
+                _record(f"iter{iteration} union")
             else:
                 print("✗ Union operation did not produce output")
                 continue
@@ -1040,6 +1084,7 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
                 best_iou, num_ops, new_script, new_stl = refined
                 current_reconstruction = new_stl
                 current_cadquery_script = new_script
+                _record(f"iter{iteration} fillet/chamfer")
                 print(f"  ✓ Applied {num_ops} edge op(s) → IoU {best_iou:.6f}")
             else:
                 print(f"  No fillet/chamfer improvement; keeping current solid")
@@ -1060,6 +1105,23 @@ def process_single_stl(stl_path, alpha=0.01, folder_name="search_greedy_parallel
             f.writelines(out)
 
     import shutil
+    # Ship the best-scoring solid from ANY step, not whatever the last step
+    # happened to leave behind. Cut/union/fillet passes can each decay IoU,
+    # and the final state is not necessarily the best one seen — so fall back
+    # to the running best recorded by `_record` above.
+    if best_refined_stl and current_reconstruction != best_refined_stl:
+        try:
+            cur = mesh_iou_cpu_boolean(original_stl_path, current_reconstruction,
+                                       normalize=True)
+        except Exception:
+            cur = None
+        if cur is None or (best_refined_iou is not None and best_refined_iou > cur + 1e-9):
+            shown = f"{cur:.6f}" if cur is not None else "n/a"
+            print(f"\n⚠️  Refinement decayed IoU (final {shown} < best {best_refined_iou:.6f}); "
+                  f"keeping the best step: {os.path.basename(best_refined_stl)}")
+            current_reconstruction = best_refined_stl
+            current_cadquery_script = best_refined_script
+
     if current_reconstruction != reconstructed_path:
         shutil.copy(current_reconstruction, final_output)
         _copy_script_stripped(current_cadquery_script, final_script_output)

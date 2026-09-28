@@ -21,6 +21,21 @@ import json
 import argparse
 import numpy as np
 import trimesh
+
+# Deterministic sampling. Every analysis stage draws random points on the
+# surface (plane detection, Chamfer sweeps, revolve axis tests); left unseeded
+# each run detects a slightly different set of planes and therefore a different
+# set of loops, so identical inputs produced reconstructions ranging from
+# IoU 0.82 to 0.98. Seed once at import; override with CADFIT_SEED.
+import numpy as _np_seed_mod
+CADFIT_SEED = int(os.environ.get("CADFIT_SEED", "0"))
+_np_seed_mod.random.seed(CADFIT_SEED)
+try:
+    import random as _py_random
+    _py_random.seed(CADFIT_SEED)
+except Exception:
+    pass
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -31,7 +46,12 @@ import os
 import multiprocessing as mp
 from functools import partial
 
-cd_threshold = 0.05
+# Chamfer-distance cutoff below which a swept interval is considered a valid
+# constant cross-section. Overridable for thin-walled parts, where the default
+# admits intervals that run past the true end of the feature.
+cd_threshold = float(os.environ.get("CADFIT_CD_THRESHOLD", 0.05))
+# Number of sweep steps to pad each detected interval by on the low side.
+_INTERVAL_PAD = int(os.environ.get("CADFIT_INTERVAL_PAD", 1))
 
 def chamfer_distance(points_a, points_b):
     """
@@ -241,8 +261,12 @@ def plot_cd_vs_translation_all_loops(loops_data, sketch_idx, output_folder, save
             # Check if CD values in this interval are all < cd_threshold
             interval_cd_values = cd_values[interval_start:interval_end]
             if np.mean(interval_cd_values) < cd_threshold:
-                # Expand interval by one step on each side, clipped to valid range
-                expanded_start = max(0, interval_start - 1)
+                # Expand interval by one step on each side, clipped to valid range.
+                # The pad guards against the sweep grid just missing a feature
+                # edge, but it also makes every extrusion overhang its true
+                # extent by one step — on thin-walled parts that is a large
+                # fraction of the wall, so it is tunable.
+                expanded_start = max(0, interval_start - _INTERVAL_PAD)
                 expanded_end = min(len(translation_factors) - 1, interval_end)
                 
                 # Save interval data
@@ -341,8 +365,12 @@ def plot_cd_vs_translation_all_loops(loops_data, sketch_idx, output_folder, save
             # Check if mean CD values in this interval are all < cd_threshold
             interval_mean_cd = mean_cd[interval_start:interval_end]
             if np.all(interval_mean_cd < cd_threshold):
-                # Expand interval by one step on each side, clipped to valid range
-                expanded_start = max(0, interval_start - 1)
+                # Expand interval by one step on each side, clipped to valid range.
+                # The pad guards against the sweep grid just missing a feature
+                # edge, but it also makes every extrusion overhang its true
+                # extent by one step — on thin-walled parts that is a large
+                # fraction of the wall, so it is tunable.
+                expanded_start = max(0, interval_start - _INTERVAL_PAD)
                 expanded_end = min(len(translation_factors) - 1, interval_end)
                 
                 # Save interval data for mean curve

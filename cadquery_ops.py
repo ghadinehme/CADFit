@@ -1762,19 +1762,43 @@ def run_instruction_groups(groups, gt_mesh, output_folder, filename_suffix="tmp"
         if len(all_meshes) == 1:
             combined_mesh = all_meshes[0]
         else:
-            # Union all meshes. trimesh's union has an `is_volume` precheck
-            # that fails on non-watertight CadQuery STL exports; fall back to
-            # concatenation (which keeps multi-solid composition working — IoU
-            # will still be computed correctly downstream via mesh booleans).
-            from iou import _alpha_wrap
-            combined_mesh = _alpha_wrap(all_meshes[0])
-            for mesh in all_meshes[1:]:
-                mesh = _alpha_wrap(mesh)
-                try:
-                    combined_mesh = combined_mesh.union(mesh)
-                except Exception as e:
-                    print(f"  Warning: union failed ({e}); falling back to concatenate")
-                    combined_mesh = trimesh.util.concatenate([combined_mesh, mesh])
+            # Union the parts exactly. Alpha-wrapping each mesh first (the
+            # previous approach) inflates thin walls and bridges gaps, and
+            # concatenating leaves a compound whose overlapping shells make
+            # the volume — and therefore the IoU the search maximizes —
+            # double-count. Fall back to the old path only if this fails.
+            combined_mesh = None
+            try:
+                import manifold3d as _m3d
+                from iou import _to_manifold, _OP_ADD as _ADD
+                mans = []
+                for _msh in all_meshes:
+                    for _part in _msh.split(only_watertight=False):
+                        if not len(_part.faces):
+                            continue
+                        _mm = _to_manifold(_part)
+                        if _mm is not None:
+                            mans.append(_mm)
+                if mans:
+                    _u = mans[0] if len(mans) == 1 else _m3d.Manifold.batch_boolean(mans, _ADD)
+                    if _u is not None and np.isfinite(_u.volume()) and _u.volume() > 0:
+                        _um = _u.to_mesh()
+                        combined_mesh = trimesh.Trimesh(
+                            vertices=np.asarray(_um.vert_properties)[:, :3],
+                            faces=np.asarray(_um.tri_verts), process=True)
+            except Exception as e:
+                print(f"  Exact union unavailable ({e}); using alpha-wrap path")
+                combined_mesh = None
+            if combined_mesh is None:
+                from iou import _alpha_wrap
+                combined_mesh = _alpha_wrap(all_meshes[0])
+                for mesh in all_meshes[1:]:
+                    mesh = _alpha_wrap(mesh)
+                    try:
+                        combined_mesh = combined_mesh.union(mesh)
+                    except Exception as e:
+                        print(f"  Warning: union failed ({e}); falling back to concatenate")
+                        combined_mesh = trimesh.util.concatenate([combined_mesh, mesh])
         
         # Save combined mesh
         output_path = f'{output_folder}/greedy_{filename_suffix}'
